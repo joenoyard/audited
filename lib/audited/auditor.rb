@@ -47,17 +47,14 @@ module Audited
         # don't allow multiple calls
         return if self.included_modules.include?(Audited::Auditor::AuditedInstanceMethods)
 
-        class_attribute :non_audited_columns,   :instance_writer => false
-        class_attribute :auditing_enabled,      :instance_writer => false
+        options = {:protect => accessible_attributes.empty?}.merge(options)
+
+        class_attribute :audit_options, :instance_writer => false
+        class_attribute :auditing_enabled, :instance_writer => false
         class_attribute :audit_associated_with, :instance_writer => false
 
-        if options[:only]
-          except = self.column_names - options[:only].flatten.map(&:to_s)
-        else
-          except = default_ignored_attributes + Audited.ignored_attributes
-          except |= Array(options[:except]).collect(&:to_s) if options[:except]
-        end
-        self.non_audited_columns = except
+        self.audit_options = options
+
         self.audit_associated_with = options[:associated_with]
 
         if options[:comment_required]
@@ -66,11 +63,12 @@ module Audited
         end
 
         attr_accessor :audit_comment
-        unless options[:allow_mass_assignment]
+        unless accessible_attributes.empty? || options[:protect]
           attr_accessible :audit_comment
         end
 
         has_many :audits, :as => :auditable, :class_name => Audited.audit_class.name
+		attr_protected :audit_ids if options[:protect]
         Audited.audit_class.audited_class_names << self.to_s
 
         after_create  :audit_create if !options[:on] || (options[:on] && options[:on].include?(:create))
@@ -93,9 +91,28 @@ module Audited
       def has_associated_audits
         has_many :associated_audits, :as => :associated, :class_name => Audited.audit_class.name
       end
+
+      def non_audited_columns
+        @non_audited_columns ||= begin
+          if audit_options[:only]
+            except = column_names - Array(audit_options[:only]).map(&:to_s)
+          else
+            except = [primary_key, inheritance_column] + ActsAsAudited.ignored_attributes
+            except |= Array(audit_options[:except]).collect(&:to_s) if audit_options[:except]
+          end
+
+          except
+        end
+      end
+
     end
 
     module AuditedInstanceMethods
+
+      def non_audited_columns
+        self.class.non_audited_columns
+      end
+
       # Temporarily turns off auditing while saving.
       def save_without_auditing
         without_auditing { save }
@@ -119,7 +136,7 @@ module Audited
       #   end
       #
       def revisions(from_version = 1)
-        audits = self.audits.from_version(from_version)
+        audits = self.audits.where(['version >= ?', from_version])
         return [] if audits.empty?
         revisions = []
         audits.each do |audit|
@@ -148,8 +165,7 @@ module Audited
 
       def revision_with(attributes)
         self.dup.tap do |revision|
-          revision.id = id
-          revision.send :instance_variable_set, '@attributes', self.attributes
+          revision.send :instance_variable_set, '@attributes', self.attributes_before_type_cast
           revision.send :instance_variable_set, '@new_record', self.destroyed?
           revision.send :instance_variable_set, '@persisted', !self.destroyed?
           revision.send :instance_variable_set, '@readonly', false
@@ -184,36 +200,36 @@ module Audited
       def audits_to(version = nil)
         if version == :previous
           version = if self.version
-                      self.version - 1
-                    else
-                      previous = audits.descending.offset(1).first
-                      previous ? previous.version : 1
-                    end
+            self.version - 1
+          else
+            previous = audits.descending.offset(1).first
+            previous ? previous.version : 1
+          end
         end
-        audits.to_version(version)
+        audits.where(['version <= ?', version])
       end
 
       def audit_create
         write_audit(:action => 'create', :audited_changes => audited_attributes,
-                    :comment => audit_comment)
+          :comment => audit_comment)
       end
 
       def audit_update
-        unless (changes = audited_changes).empty? && audit_comment.blank?
+        unless (changes = audited_changes).empty?
           write_audit(:action => 'update', :audited_changes => changes,
-                      :comment => audit_comment)
+            :comment => audit_comment)
         end
       end
 
       def audit_destroy
         write_audit(:action => 'destroy', :audited_changes => audited_attributes,
-                    :comment => audit_comment)
+          :comment => audit_comment)
       end
 
       def write_audit(attrs)
         attrs[:associated] = self.send(audit_associated_with) unless audit_associated_with.nil?
         self.audit_comment = nil
-        run_callbacks(:audit)  { self.audits.create(attrs) } if auditing_enabled
+        self.audits.create attrs if auditing_enabled
       end
 
       def require_comment
